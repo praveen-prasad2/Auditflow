@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `one_active_audit_per_owner` ON `records` (`owner`) WHERE kind = 'audit' AND json_extract(data, '$.status') IN ('queued','running');

@@ -1,0 +1,23 @@
+import {PGlite} from '@electric-sql/pglite';
+import {readFile} from 'node:fs/promises';
+import assert from 'node:assert/strict';
+const db=new PGlite();
+await db.exec(`create role anon; create role authenticated; create schema auth; create table auth.users(id uuid primary key); create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$; grant usage on schema auth to anon,authenticated; grant execute on function auth.uid() to anon,authenticated; insert into auth.users values ('11111111-1111-4111-8111-111111111111'),('22222222-2222-4222-8222-222222222222');`);
+await db.exec(await readFile('supabase/migrations/20260927_auditflow.sql','utf8'));
+const alice='11111111-1111-4111-8111-111111111111',bob='22222222-2222-4222-8222-222222222222';
+async function asUser(id){await db.exec('reset role;set role authenticated');await db.query("select set_config('request.jwt.claim.sub',$1,false)",[id])}
+await asUser(alice);
+const audit={id:'audit-a',status:'queued',result:{pages:[],findings:[]}};
+await db.query('insert into public.auditflow_records(owner,kind,id,data) values ($1,$2,$3,$4)',[alice,'audit','audit-a',audit]);
+await assert.rejects(()=>db.query('insert into public.auditflow_records(owner,kind,id,data) values ($1,$2,$3,$4)',[alice,'audit','audit-b',{status:'queued'}]),/unique/);
+const claim=(await db.query("select public.auditflow_claim_audit('audit-a') as value")).rows[0].value;assert.equal(claim.status,'running');assert.equal((await db.query("select public.auditflow_claim_audit('audit-a') as value")).rows[0].value,null);
+await db.query('select public.auditflow_save_audit($1,$2)',['audit-a',{...claim,result:{pages:[{url:'https://example.com'}]},releaseLease:true}]);
+assert.equal((await db.query("select data from public.auditflow_records where id='audit-a'")).rows[0].data.lease,0);
+const nextClaim=(await db.query("select public.auditflow_claim_audit('audit-a') as value")).rows[0].value;
+await db.query("update public.auditflow_records set data=jsonb_set(data,'{status}','\"cancelled\"') where id='audit-a'");await db.query('select public.auditflow_save_audit($1,$2)',['audit-a',{...nextClaim,status:'complete',releaseLease:true}]);assert.equal((await db.query("select data from public.auditflow_records where id='audit-a'")).rows[0].data.status,'cancelled');
+await db.query('insert into public.auditflow_records(owner,kind,id,data) values ($1,$2,$3,$4)',[alice,'report','report-a',{title:'Private report'}]);await db.query("insert into public.auditflow_shares(owner,report_id,token_hash,expires_at) values ($1,'report-a',$2,now()+interval '1 day')",[alice,'a'.repeat(64)]);
+await asUser(bob);assert.equal((await db.query('select * from public.auditflow_records')).rows.length,0);assert.equal((await db.query('select * from public.auditflow_shares')).rows.length,0);await assert.rejects(()=>db.query('insert into public.auditflow_records(owner,kind,id,data) values ($1,$2,$3,$4)',[alice,'client','intrusion',{}]),/row-level security/);assert.equal((await db.query("select public.auditflow_claim_audit('audit-a') as value")).rows[0].value,null);
+await db.exec('reset role;set role anon');await assert.rejects(()=>db.query('select * from public.auditflow_records'),/permission denied/);assert.equal((await db.query('select public.auditflow_shared_report($1) as value',['a'.repeat(64)])).rows[0].value.title,'Private report');assert.equal((await db.query('select public.auditflow_shared_report($1) as value',['b'.repeat(64)])).rows[0].value,null);await assert.rejects(()=>db.query("select public.auditflow_claim_audit('audit-a')"),/permission denied/);
+await asUser(alice);await db.query('update public.auditflow_shares set expires_at=now()-interval \'1 day\'');await db.exec('reset role;set role anon');assert.equal((await db.query('select public.auditflow_shared_report($1) as value',['a'.repeat(64)])).rows[0].value,null);
+await asUser(alice);await db.query('delete from public.auditflow_shares');assert.equal((await db.query('select public.auditflow_shared_report($1) as value',['a'.repeat(64)])).rows[0].value,null);
+await db.close();console.log('PASS: PostgreSQL migration, account isolation, owner spoof rejection, anonymous denial, audit lease/release, cancellation safety, share lookup, expiry and revocation.');
